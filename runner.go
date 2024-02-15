@@ -12,7 +12,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"text/template"
@@ -32,14 +31,16 @@ func Main() {
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Println(version())
+		fmt.Println(GetVersion())
 		return
 	}
 }
 
 func Build(ctx context.Context, args ...string) error {
 	var err error
-	plugins := []Dependency{}
+	var skipCleanup bool
+
+	var plugins []Dependency
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--with":
@@ -56,6 +57,8 @@ func Build(ctx context.Context, args ...string) error {
 				PackagePath: mod,
 				Version:     ver,
 			})
+		case "--skip_cleanup":
+			skipCleanup = true
 		default:
 			continue
 		}
@@ -86,13 +89,14 @@ func Build(ctx context.Context, args ...string) error {
 		return err
 	}
 
-	log.Printf("[INFO] Written main.go: %s", buf)
+	log.Printf("[INFO] Written main.go:\n%v", buf)
 
 	// create the folder in which the build environment will operate
 	tempFolder, err := newTempFolder()
 	if err != nil {
 		return err
 	}
+	// if there's an error, clean up the temp folder
 	defer func() {
 		if err != nil {
 			err2 := os.RemoveAll(tempFolder)
@@ -169,7 +173,13 @@ func Build(ctx context.Context, args ...string) error {
 		return err
 	}
 
-	return nil
+	if skipCleanup {
+		log.Printf("[INFO] Skipping cleanup as requested; leaving folder intact: %s", tempFolder)
+		return nil
+	}
+
+	log.Printf("[INFO] Cleaning up temporary folder: %s", tempFolder)
+	return os.RemoveAll(tempFolder)
 }
 
 func trapSignals(ctx context.Context, cancel context.CancelFunc) {
@@ -183,45 +193,6 @@ func trapSignals(ctx context.Context, cancel context.CancelFunc) {
 	case <-ctx.Done():
 		return
 	}
-}
-
-// version returns a detailed version string, if available.
-func version() string {
-	mod := goModule()
-	ver := mod.Version
-	if mod.Sum != "" {
-		ver += " " + mod.Sum
-	}
-	if mod.Replace != nil {
-		ver += " => " + mod.Replace.Path
-		if mod.Replace.Version != "" {
-			ver += "@" + mod.Replace.Version
-		}
-		if mod.Replace.Sum != "" {
-			ver += " " + mod.Replace.Sum
-		}
-	}
-	return ver
-}
-
-func goModule() *debug.Module {
-	mod := &debug.Module{}
-	mod.Version = "unknown"
-	bi, ok := debug.ReadBuildInfo()
-	if ok {
-		mod.Path = bi.Main.Path
-		// The recommended way to build xcaddy involves
-		// creating a separate main module, which
-		// TODO: track related Go issue: https://github.com/golang/go/issues/29228
-		// once that issue is fixed, we should just be able to use bi.Main... hopefully.
-		for _, dep := range bi.Deps {
-			if dep.Path == "github.com/caddyserver/xcaddy" {
-				return dep
-			}
-		}
-		return &bi.Main
-	}
-	return mod
 }
 
 // newTempFolder creates a new folder in a temporary location.
@@ -306,7 +277,7 @@ func runCommand(ctx context.Context, cmd *exec.Cmd) error {
 	// channel is closed -- whichever comes first
 	select {
 	case cmdErr := <-cmdErrChan:
-		// process ended; report any error immediately
+		// the process ended; report any error immediately
 		return cmdErr
 	case <-ctx.Done():
 		// context was canceled, either due to timeout or
@@ -328,7 +299,7 @@ func runCommand(ctx context.Context, cmd *exec.Cmd) error {
 // of "foo" and "v2.0.0" will return "foo/v2", for use in Go imports and go commands.
 // Inputs that conflict, like "foo/v2" and "v3.1.0" are an error. This function
 // returns the input if the moduleVersion is not a valid semantic version string.
-// If moduleVersion is empty string, the input modulePath is returned without error.
+// If moduleVersion is an empty string, the input modulePath is returned without an error.
 func versionedModulePath(modulePath, moduleVersion string) (string, error) {
 	if moduleVersion == "" {
 		return modulePath, nil
